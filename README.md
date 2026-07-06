@@ -38,14 +38,6 @@ This standalone reproducer triggers the same underlying fault. It has two modes:
   Same root cause, different manifestation depending on whether the graph exec was
   instantiated before or after the buffers were freed.
 
-## Is the 700 a re-surfaced earlier async error?
-
-No. With `--verbose-cuda` (which sets `wp.config.verify_cuda=True`, forcing a
-`cudaDeviceSynchronize` + explicit error check after **every** launch), the first launch
-and the rebuild both complete cleanly; the error originates at the **first relaunch after
-the rebuild**, at `wp_cuda_graph_launch`. The subsequent 700s in `wp_free_device_async` /
-`wp_cuda_unload_module` / `wp_cuda_stream_destroy` are the *cascade* from CUDA's sticky
-error state during teardown, not independent faults.
 
 ## Root cause
 
