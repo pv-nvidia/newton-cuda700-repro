@@ -1,0 +1,23 @@
+[project]
+name = "newton-cuda700-repro"
+version = "0.1.0"
+description = "Minimal reproducer: Newton CUDA graph replayed after a solver/model reset -> CUDA 700 illegal memory access at wp_cuda_graph_launch"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # Newton is sourced from GitHub main (the PyPI `newton` package is unrelated).
+    "newton @ git+https://github.com/newton-physics/newton.git@main",
+    # Solvers (SolverVBD + collision) need the `sim` extras (mujoco-warp).
+    "mujoco-warp",
+    "warp-lang",
+]
+
+[project.optional-dependencies]
+# Pin the exact combo this was last verified crashing on, for reproducibility.
+pinned = [
+    "warp-lang==1.16.0.dev20260706",
+]
+
+[tool.uv]
+# Allow the git dependency + pre-release warp/newton dev wheels.
+prerelease = "allow"

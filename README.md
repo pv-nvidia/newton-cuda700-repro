@@ -64,21 +64,39 @@ while a CUDA graph captured before the reset is still held and later launched.
 
 ## Reproduce
 
-Requires an NVIDIA GPU + a Newton install with the `sim` extras (mujoco-warp).
+Requires an NVIDIA GPU. Uses [uv](https://docs.astral.sh/uv/) to pull Newton from GitHub
+`main` together with the `sim` extras (mujoco-warp).
 
 ```bash
+# Create the environment and install Newton (git main) + warp + mujoco-warp.
+uv sync
+
 # Default: launch graph OK, rebuild solver/model under the live graph, relaunch -> CUDA 700
-python repro_cuda700_reset.py --verbose-cuda
+uv run repro_cuda700_reset.py --verbose-cuda
 
 # Alternate: reinit before first launch -> faults at graph instantiation (CUDA err 1)
-python repro_cuda700_reset.py --mode create_err
+uv run repro_cuda700_reset.py --mode create_err
 
 # Baseline: no reinit -> runs clean
-python repro_cuda700_reset.py --mode create_err --no-reinit
+uv run repro_cuda700_reset.py --mode create_err --no-reinit
 
 # Reinit AND re-capture the graph against the fresh buffers -> runs clean
-python repro_cuda700_reset.py --mode create_err --recapture
+uv run repro_cuda700_reset.py --mode create_err --recapture
 ```
+
+To pin the exact warp build this was last verified crashing on:
+
+```bash
+uv sync --extra pinned
+```
+
+## Environment
+
+- GPU: NVIDIA L40 (also seen on Blackwell RTX PRO 5000), driver 570.158.01, CUDA 12.8
+- Newton: `main` (verified crashing at HEAD `9bff8911`), also on an earlier snapshot
+- warp-lang: `1.16.0.dev20260706` (also `1.14.0`)
+- mujoco-warp: `3.10.0.1`
+- Python 3.12, Linux x86_64
 
 ## Verdict matrix (reproduced on two Newton/Warp combos)
 
