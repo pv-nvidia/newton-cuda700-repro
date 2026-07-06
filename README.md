@@ -14,14 +14,38 @@ Warp CUDA error 700: an illegal memory access was encountered
 ... cascade of 700 in wp_free_device_async (warp.cu:869)
 ```
 
-This standalone reproducer triggers the same underlying fault (manifesting at graph
-*instantiation* as `wp_cuda_graph_create_exec` error 1, or at *launch* as error 700
-depending on capture timing):
+This standalone reproducer triggers the same underlying fault. It has two modes:
 
-```
-Warp CUDA error 1: invalid argument (in function wp_cuda_graph_create_exec, warp.cu:3620)
-RuntimeError: Graph creation error: Warp CUDA error 1: invalid argument ...
-```
+* `--mode launch_700` (default): launch the captured graph once successfully, then rebuild
+  the solver/model under the live graph (freeing + reallocating the buffers it captured),
+  then relaunch. This faults **exactly like the real workload**:
+
+  ```
+  Warp CUDA error 700: an illegal memory access was encountered
+      (in function wp_cuda_graph_launch, warp.cu:4316)
+  ... cascade of 700 in wp_free_device_async (warp.cu:869),
+      wp_cuda_unload_module, wp_cuda_stream_destroy during teardown
+  ```
+
+* `--mode create_err`: reinit first, then replay the stale graph. Warp instantiates the
+  graph exec lazily at first launch against already-freed buffers, so it faults earlier at
+  graph *instantiation*:
+
+  ```
+  Warp CUDA error 1: invalid argument (in function wp_cuda_graph_create_exec, warp.cu:3620)
+  ```
+
+  Same root cause, different manifestation depending on whether the graph exec was
+  instantiated before or after the buffers were freed.
+
+## Is the 700 a re-surfaced earlier async error?
+
+No. With `--verbose-cuda` (which sets `wp.config.verify_cuda=True`, forcing a
+`cudaDeviceSynchronize` + explicit error check after **every** launch), the first launch
+and the rebuild both complete cleanly; the error originates at the **first relaunch after
+the rebuild**, at `wp_cuda_graph_launch`. The subsequent 700s in `wp_free_device_async` /
+`wp_cuda_unload_module` / `wp_cuda_stream_destroy` are the *cascade* from CUDA's sticky
+error state during teardown, not independent faults.
 
 ## Root cause
 
@@ -43,27 +67,27 @@ while a CUDA graph captured before the reset is still held and later launched.
 Requires an NVIDIA GPU + a Newton install with the `sim` extras (mujoco-warp).
 
 ```bash
-# Default: capture graph, reinit solver/state/contacts, replay STALE graph -> CRASH
-python repro_cuda700_reset.py
+# Default: launch graph OK, rebuild solver/model under the live graph, relaunch -> CUDA 700
+python repro_cuda700_reset.py --verbose-cuda
+
+# Alternate: reinit before first launch -> faults at graph instantiation (CUDA err 1)
+python repro_cuda700_reset.py --mode create_err
 
 # Baseline: no reinit -> runs clean
-python repro_cuda700_reset.py --no-reinit
+python repro_cuda700_reset.py --mode create_err --no-reinit
 
 # Reinit AND re-capture the graph against the fresh buffers -> runs clean
-python repro_cuda700_reset.py --recapture
-
-# Rebuild the whole Model on reinit (not just solver/state/contacts) -> also crashes
-python repro_cuda700_reset.py --full
+python repro_cuda700_reset.py --mode create_err --recapture
 ```
 
 ## Verdict matrix (reproduced on two Newton/Warp combos)
 
 | Config              | warp 1.14.0 / newton snapshot | warp 1.16.0.dev20260706 / newton main `9bff8911` |
 |---------------------|-------------------------------|--------------------------------------------------|
-| default (`--reinit`)| **CRASH**                     | **CRASH**                                        |
-| `--no-reinit`       | clean                         | clean                                            |
-| `--recapture`       | clean                         | clean                                            |
-| `--full`            | **CRASH**                     | **CRASH**                                        |
+| `--mode launch_700` (default) | **CUDA 700 @ graph_launch** | **CUDA 700 @ graph_launch** |
+| `--mode create_err` | **CUDA err1 @ graph_create_exec** | **CUDA err1 @ graph_create_exec** |
+| `--mode create_err --no-reinit` | clean | clean |
+| `--mode create_err --recapture` | clean | clean |
 
 **Updating to the latest Newton (`main`) does not fix it.** Re-capturing the graph after
 the reset is the only currently-known safe path.

@@ -61,13 +61,17 @@ class ClothScene:
 
         self._build()
 
-    def _build(self):
+    def _build(self, dim: int = 40):
         """(Re)build model, solver, states and contacts from scratch.
 
         This mirrors what IsaacLab's PhysicsManager.reset(soft=False) does:
         finalize a fresh Model (new device buffers) and construct a new solver
-        + state + contacts bound to those buffers.
+        + state + contacts bound to those buffers. ``dim`` controls the cloth
+        grid resolution; changing it between builds forces differently-sized
+        particle / contact buffers (and different device addresses), which is
+        what makes a stale captured graph dereference invalid memory.
         """
+        self._dim = dim
         builder = newton.ModelBuilder()
 
         # A cloth grid that will fall and contact the ground plane -> exercises
@@ -76,8 +80,8 @@ class ClothScene:
             pos=wp.vec3(0.0, 0.0, 2.0),
             rot=wp.quat_identity(),
             vel=wp.vec3(0.0, 0.0, 0.0),
-            dim_x=40,
-            dim_y=40,
+            dim_x=dim,
+            dim_y=dim,
             cell_x=0.1,
             cell_y=0.1,
             mass=0.1,
@@ -125,7 +129,31 @@ class ClothScene:
             self.simulate()
         self.sim_time += self.frame_dt
 
-    def reinit_solver(self, full: bool = False):
+    def free_old_buffers(self):
+        """Drop all Python references to old solver/state/contacts so their device
+        buffers are freed by Warp's allocator, WITHOUT rebuilding new ones yet.
+
+        This isolates the 'buffers freed under a live graph' condition: the graph
+        was already successfully instantiated + launched once, then the memory it
+        references is returned to the pool. The next launch should then fault at
+        wp_cuda_graph_launch (CUDA 700) rather than at graph instantiation.
+        """
+        self.solver = None
+        self.state_0 = None
+        self.state_1 = None
+        self.control = None
+        self.contacts = None
+        import gc
+
+        gc.collect()
+        # Force the Warp allocator to actually release freed blocks back to CUDA.
+        try:
+            wp.get_device().synchronize()
+            wp.get_device().memory_pool.release_all() if hasattr(wp.get_device(), "memory_pool") else None
+        except Exception as e:  # noqa: BLE001
+            print(f"[repro]   (mempool release note: {e})")
+
+    def reinit_solver(self, full: bool = False, dim: int | None = None):
         """Simulate a sim reset, leaving the captured graph pointing at old buffers.
 
         * ``full=True``  : rebuild everything (Model + solver + state + contacts).
@@ -134,10 +162,18 @@ class ClothScene:
           builds a fresh solver + State/contacts bound to the existing model,
           reallocating the soft-contact / collision device buffers touched by
           ``create_soft_contacts`` in the narrow phase.
+        * ``dim`` (with ``full=True``): rebuild the Model at a DIFFERENT cloth
+          resolution, forcing differently-sized buffers at new device addresses.
         """
         old_graph = self.graph
         if full:
-            self._build()  # new model + everything
+            self.solver = None
+            self.state_0 = self.state_1 = self.control = self.contacts = None
+            self.model = None
+            import gc
+
+            gc.collect()
+            self._build(dim=dim if dim is not None else self._dim)  # new model + everything
         else:
             self.solver = newton.solvers.SolverVBD(model=self.model, iterations=10)
             self.state_0 = self.model.state()
@@ -167,7 +203,32 @@ def main():
         action="store_true",
         help="On reinit, rebuild the whole Model (not just solver/state/contacts).",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["create_err", "launch_700"],
+        default="launch_700",
+        help="create_err: reinit then replay stale graph (faults at graph instantiation, err1). "
+        "launch_700: launch graph successfully ONCE, then free/realloc buffers, then relaunch "
+        "(targets CUDA 700 at wp_cuda_graph_launch, matching the real workload).",
+    )
+    parser.add_argument(
+        "--verbose-cuda",
+        action="store_true",
+        help="Enable Warp verbose + verify_cuda (sync+error-check after each launch) to pinpoint "
+        "WHICH launch first errored, i.e. whether 700 is a re-surfaced earlier async error.",
+    )
+    parser.add_argument(
+        "--resize-dim",
+        type=int,
+        default=80,
+        help="In launch_700 mode, rebuild the cloth at this grid dim (default 80 vs initial 40) "
+        "to force differently-sized buffers at new addresses under the live graph.",
+    )
     args = parser.parse_args()
+
+    if args.verbose_cuda:
+        wp.config.verbose = True
+        print("[repro] wp.config.verbose=True (verify_cuda enabled after capture)")
 
     wp.init()
     device = wp.get_device()
@@ -183,6 +244,39 @@ def main():
     print("[repro] capturing CUDA graph...")
     scene.capture()
     wp.synchronize_device()
+
+    if args.mode == "launch_700":
+        # 1) Launch the captured graph ONCE successfully -> forces Warp to
+        #    instantiate the graph exec against the CURRENT (valid) buffers.
+        print("[repro] launch_700: launching graph once (should instantiate + run OK)...")
+        scene.step()
+        wp.synchronize_device()
+        print("[repro]   first launch ok (graph exec instantiated)")
+
+        # 2) Tear down the old solver/state/contacts and rebuild at a DIFFERENT
+        #    cloth resolution. This frees the buffers the graph captured and
+        #    allocates differently-sized ones (new addresses / layout) -- exactly
+        #    the hazard env.sim.reset() creates when it rebuilds the Newton solver
+        #    under a live graph. The stale graph's kernels still use the OLD
+        #    pointers/sizes.
+        print(f"[repro] launch_700: rebuilding model at dim={args.resize_dim} under live graph...")
+        scene.reinit_solver(full=True, dim=args.resize_dim)
+        wp.synchronize_device()
+
+        # Turn on per-launch CUDA error verification now (illegal during capture).
+        if args.verbose_cuda:
+            wp.config.verify_cuda = True
+            print("[repro] verify_cuda=True (sync+error-check after each launch)")
+
+        # 3) Re-launch the SAME already-instantiated graph -> should now fault at
+        #    wp_cuda_graph_launch with CUDA 700 (illegal access on freed mem).
+        print(f"[repro] launch_700: re-launching stale graph {args.steps}x (expect CUDA 700)...")
+        for i in range(args.steps):
+            wp.capture_launch(scene.graph)
+            wp.synchronize_device()
+            print(f"[repro]   relaunch {i} ok")
+        print("[repro] DONE without crash.")
+        return
 
     if args.reinit:
         print("[repro] reinitializing solver/model/state (simulates env.sim.reset())...")
