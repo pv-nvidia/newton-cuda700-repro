@@ -118,3 +118,65 @@ Either:
 ## Files
 
 - `repro_cuda700_reset.py` — the reproducer (cloth grid + ground plane + VBD solver + soft contacts).
+- `repro_narrowphase_rebuild.py` — **sharper, graph-free reproducer** (see below).
+
+---
+
+# Sharper repro: stale CollisionPipeline reused across a model re-finalize (no CUDA graph)
+
+`repro_narrowphase_rebuild.py` isolates the **true root cause** with NO CUDA graph at all —
+every launch is eager. It is the most direct minimal repro for the Newton team.
+
+## Mechanism
+
+`CollisionPipeline.collide(state, contacts)` launches its first kernel, `compute_shape_aabbs`,
+with `dim = self.model.shape_count`, reading `self.model.shape_transform / shape_body /
+shape_type / ...` — i.e. the device arrays of the `Model` the **pipeline** was built on
+(`self.model`), *not* the model backing the `state` argument.
+
+In IsaacLab, `env.sim.reset()` re-finalizes the `Model` (reassigning `NewtonManager._model`),
+freeing the OLD model's device arrays. The `CollisionPipeline` object is **not** rebuilt
+(`_initialize_contacts` only builds a new one `if _collision_pipeline is None`, and reset
+historically never nulled it), so it still points at the freed arrays via `self.model`. The
+next `collide()` dereferences freed device memory → CUDA 700, surfacing as:
+
+```
+Warp Error: Error launching kernel: compute_shape_aabbs on device cuda:0: CUDA error detected: 700
+RuntimeError: CUDA error detected: 700
+```
+
+(without `CUDA_LAUNCH_BLOCKING=1` the async fault is deferred and instead surfaces at the
+later `narrow_phase_kernel_gjk_mpr` launch / the next `wp_cuda_context_synchronize`, then a
+cascade of `wp_free_device_async` / `wp_cuda_unload_module` / `wp_cuda_stream_destroy` 700s
+at teardown — matching the real workload).
+
+## Reproduce
+
+```bash
+# Crash: build pipeline on model #1, FREE the model arrays it reads + churn the
+# allocator (reproducing IsaacLab's dangling-pointer state), then collide() again.
+CUDA_LAUNCH_BLOCKING=1 uv run repro_narrowphase_rebuild.py --verbose-cuda
+
+# Control: identical, but DON'T free the arrays -> clean, exit 0.
+uv run repro_narrowphase_rebuild.py --no-free-model-arrays
+
+# Baseline: pipeline #1 only, no rebuild -> clean.
+uv run repro_narrowphase_rebuild.py --no-rebuild
+```
+
+The A/B (`--free-model-arrays` faults, `--no-free-model-arrays` is clean, everything else
+identical) isolates the freed-model-array read as the sole trigger.
+
+## What we'd like from Newton (narrow-phase / pipeline)
+
+1. **Bounds-safety / clear error:** `compute_shape_aabbs` and `narrow_phase_kernel_gjk_mpr`
+   index `shape_*[shape_a]` with only a `>= 0` guard (no upper bound vs the live array
+   sizes). A model/state or freed-buffer mismatch should raise a clear error rather than
+   perform an out-of-bounds device read → raw CUDA 700.
+2. **(Ideally)** a documented invariant that a `CollisionPipeline` is bound to the `Model`
+   it was constructed on, and/or a cheap `pipeline.rebind(model)` / validity check so callers
+   can detect a stale pipeline after a model re-finalize.
+
+The **caller-side fix** (validated in IsaacLab) is simply to rebuild the pipeline on hard
+reset — null `_collision_pipeline` + `_contacts` so a fresh pipeline is built on the
+re-finalized model.
